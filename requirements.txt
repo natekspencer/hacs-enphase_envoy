@@ -1,0 +1,8 @@
+black==23.3.0
+bs4
+colorlog==6.7.0
+envoy-utils
+homeassistant>=2023.6
+pip>=21.0
+pylint>=2.17.3
+ruff==0.0.255

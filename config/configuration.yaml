@@ -1,0 +1,15 @@
+# Limited configuration instead of default_config
+# https://www.home-assistant.io/integrations/default_config
+automation:
+dhcp:
+frontend:
+history:
+logbook:
+media_source:
+zeroconf:
+
+logger:
+  default: info
+  logs:
+    custom_components.enphase_envoy: debug
+    envoy_utils: debug

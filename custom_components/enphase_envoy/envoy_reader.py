@@ -1,14 +1,16 @@
 """Module to read production and consumption values from an Enphase Envoy on the local network."""
+from __future__ import annotations
+
 import argparse
 import asyncio
 import datetime
 import logging
-import jwt
 import re
 import time
 from json.decoder import JSONDecodeError
 
 import httpx
+import jwt
 from bs4 import BeautifulSoup
 from envoy_utils.envoy_utils import EnvoyUtils
 
@@ -25,6 +27,7 @@ LIFE_PRODUCTION_REGEX = (
 )
 SERIAL_REGEX = re.compile(r"Envoy\s*Serial\s*Number:\s*([0-9]+)")
 
+ENDPOINT_URL_INFO_XML = "http{}://{}/info.xml"
 ENDPOINT_URL_PRODUCTION_JSON = "http{}://{}/production.json"
 ENDPOINT_URL_PRODUCTION_V1 = "http{}://{}/api/v1/production"
 ENDPOINT_URL_PRODUCTION_INVERTERS = "http{}://{}/api/v1/production/inverters"
@@ -42,9 +45,9 @@ ENVOY_MODEL_LEGACY = "P0"
 LOGIN_URL = "https://entrez.enphaseenergy.com/login_main_page"
 TOKEN_URL = "https://entrez.enphaseenergy.com/entrez_tokens"
 
-# paths for the enlighten 6 month owner token
-ENLIGHTEN_AUTH_FORM_URL = "https://enlighten.enphaseenergy.com"
-ENLIGHTEN_TOKEN_URL = "https://enlighten.enphaseenergy.com/entrez-auth-token?serial_num={}"
+# Enlighten 12 month owner token (required for software >=D7)
+ENLIGHTEN_AUTH_URL = "https://enlighten.enphaseenergy.com/login/login.json"
+ENLIGHTEN_TOKEN_URL = "https://entrez.enphaseenergy.com/tokens"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +85,9 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
         "Grid status not available for your Envoy device."
     )
 
+    software: str | None = None
+    _token: str | None = None
+
     def __init__(  # pylint: disable=too-many-arguments
         self,
         host,
@@ -89,14 +95,13 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
         password="",
         inverters=False,
         async_client=None,
-        enlighten_user=None,
-        enlighten_pass=None,
         commissioned=False,
         enlighten_site_id=None,
-        enlighten_serial_num=None,
+        serial_number=None,
         https_flag="",
-        use_enlighten_owner_token=False,
-        token_refresh_buffer_seconds=0
+        use_enlighten=False,
+        token_refresh_buffer_seconds=0,
+        token: str | None = None,
     ):
         """Init the EnvoyReader."""
         self.host = host.lower()
@@ -115,22 +120,32 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
         self._async_client = async_client
         self._authorization_header = None
         self._cookies = None
-        self.enlighten_user = enlighten_user
-        self.enlighten_pass = enlighten_pass
         self.commissioned = commissioned
         self.enlighten_site_id = enlighten_site_id
-        self.enlighten_serial_num = enlighten_serial_num
+        self.serial_number = serial_number
         self.https_flag = https_flag
-        self._token = ""
-        self.use_enlighten_owner_token = use_enlighten_owner_token
+        self.use_enlighten = use_enlighten
         self.token_refresh_buffer_seconds = token_refresh_buffer_seconds
 
+        if token:
+            self.set_token(token)
+
     @property
-    def async_client(self):
+    def async_client(self) -> httpx.AsyncClient:
         """Return the httpx client."""
-        return self._async_client or httpx.AsyncClient(verify=False,
-                                                       headers=self._authorization_header,
-                                                       cookies=self._cookies)
+        return self._async_client or httpx.AsyncClient(
+            verify=False, headers=self._authorization_header, cookies=self._cookies
+        )
+
+    def get_token(self) -> str | None:
+        """Get the token."""
+        return self._token
+
+    def set_token(self, token: str) -> None:
+        """Set the token."""
+        self.https_flag = "s"
+        self._token = token
+        self._authorization_header = {"Authorization": "Bearer " + self._token}
 
     async def _update(self):
         """Update the data."""
@@ -192,8 +207,8 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
                     if resp.status_code == 401 and attempt < 2:
                         _LOGGER.debug(
                             "Received 401 from Envoy; refreshing token, attempt %s of 2",
-                            attempt+1,
-                            )
+                            attempt + 1,
+                        )
                         could_refresh_cookies = await self._refresh_token_cookies()
                         if not could_refresh_cookies:
                             await self._getEnphaseToken()
@@ -218,58 +233,42 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
         except httpx.TransportError:  # pylint: disable=try-except-raise
             raise
 
-    async def _fetch_owner_token_json(self) :
-        """
-        Try to fetch the owner token json from Enlighten API
-        :return:
-        """
+    async def _fetch_owner_token(self):
+        """Fetch the owner token from Enlighten."""
+        data = {"user[email]": self.username, "user[password]": self.password}
         async with self.async_client as client:
-            # login to the enlighten UI
+            resp = await client.post(ENLIGHTEN_AUTH_URL, data=data, timeout=10)
 
-            resp = await client.get(ENLIGHTEN_AUTH_FORM_URL)
-            soup = BeautifulSoup(resp.text, features="html.parser")
-            # grab the single use auth token for this form
-            authenticity_token = soup.find('input', {'name': 'authenticity_token'})["value"]
-            # and the form action itself
-            form_action = soup.find('input', {'name': 'authenticity_token'}).parent["action"]
-            payload_login = {
-                'authenticity_token': authenticity_token,
-                'user[email]': self.enlighten_user,
-                'user[password]': self.enlighten_pass,
-            }
-            resp = await client.post(ENLIGHTEN_AUTH_FORM_URL+form_action, data=payload_login, timeout=10)
             if resp.status_code >= 400:
-                raise Exception("Could not Authenticate via Enlighten auth form")
+                raise Exception("Could not authenticate via Enlighten")
 
-            # now that we're in a logged in session, we can request the 6 month owner token via enlighten
-            resp = await client.get(ENLIGHTEN_TOKEN_URL.format(self.enlighten_serial_num))
-            resp_json = resp.json()
-            if "token" not in resp_json.keys():
-                msg = resp_json.get("message", "Unknown error returned from enlighten: " + resp.text)
-                raise Exception("Could not get 6 month token: " + msg)
-            return resp_json
+            data = resp.json()
+            json = {
+                "session_id": data["session_id"],
+                "serial_num": self.serial_number,
+                "username": self.username,
+            }
+            resp = await client.post(ENLIGHTEN_TOKEN_URL, json=json)
+            owner_token = resp.text
+            if resp.status_code != 200:
+                raise Exception("Could not get owner token: " + resp.text)
+            return owner_token
 
     async def _getEnphaseToken(  # pylint: disable=invalid-name
         self,
     ):
-        payload_login = {
-            "username": self.enlighten_user,
-            "password": self.enlighten_pass,
-        }
+        payload_login = {"username": self.username, "password": self.password}
 
-        if self.use_enlighten_owner_token:
-            token_json = await self._fetch_owner_token_json()
-
-            self._token = token_json["token"]
-            time_left_days = (token_json["expires_at"] - time.time())/(24*3600)
-            _LOGGER.debug("Commissioned Token valid for %s days", time_left_days)
+        if self.use_enlighten:
+            if not self._token:
+                self._token = await self._fetch_owner_token()
 
         elif self.commissioned == "True" or self.commissioned == "Commissioned":
             # Login to website and store cookie
             resp = await self._async_post(LOGIN_URL, data=payload_login)
             payload_token = {
                 "Site": self.enlighten_site_id,
-                "serialNum": self.enlighten_serial_num,
+                "serialNum": self.serial_number,
             }
             response = await self._async_post(
                 TOKEN_URL, data=payload_token, cookies=resp.cookies
@@ -298,8 +297,8 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
 
     async def _refresh_token_cookies(self):
         """
-         Refresh the client's cookie with the token (if valid)
-         :returns True if cookie refreshed, False if it couldn't be
+        Refresh the client's cookie with the token (if valid)
+        :returns True if cookie refreshed, False if it couldn't be
         """
         # Create HTTP Header
         self._authorization_header = {"Authorization": "Bearer " + self._token}
@@ -312,14 +311,13 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
         # Parse the HTML return from Envoy and check the text
         soup = BeautifulSoup(token_validation_html.text, features="html.parser")
         token_validation = soup.find("h2").contents[0]
-        if self._is_enphase_token_valid(token_validation) :
+        if self._is_enphase_token_valid(token_validation):
             # set the cookies for future clients
             self._cookies = token_validation_html.cookies
             return True
 
         # token not valid if we get here
         return False
-
 
     def _is_enphase_token_valid(self, response):
         if response == "Valid token.":
@@ -363,7 +361,7 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
         if self.https_flag == "s":
             _LOGGER.debug("Checking Token value: %s", self._token)
             # Check if a token has already been retrieved
-            if self._token == "":
+            if not self._token:
                 _LOGGER.debug("Found empty token: %s", self._token)
                 await self._getEnphaseToken()
             else:
@@ -480,17 +478,28 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
 
     async def get_full_serial_number(self):
         """Method to get the  Envoy serial number."""
+        if not self.serial_number:
+            await self.read_info_xml()
+        return self.serial_number
+
+    async def read_info_xml(self) -> None:
+        """Retrieve and update data from the info.xml file."""
         response = await self._async_fetch_with_retry(
-            f"http{self.https_flag}://{self.host}/info.xml",
+            ENDPOINT_URL_INFO_XML.format(self.https_flag, self.host),
             follow_redirects=True,
         )
-        if not response.text:
-            return None
-        if "<sn>" in response.text:
-            return response.text.split("<sn>")[1].split("</sn>")[0]
-        match = SERIAL_REGEX.search(response.text)
-        if match:
-            return match.group(1)
+        if not (xml := response.text):
+            return
+
+        # set serial number
+        if match := re.search("<sn>(.*)</sn>", xml):
+            self.serial_number = match.group(1)
+        elif match := SERIAL_REGEX.search(xml):
+            self.serial_number = match.group(1)
+
+        # set software
+        if match := re.search("<software>(.*)</software>", xml):
+            self.software = match.group(1)
 
     def create_connect_errormessage(self):
         """Create error message if unable to connect to Envoy"""
@@ -737,7 +746,10 @@ class EnvoyReader:  # pylint: disable=too-many-instance-attributes
         """Return grid status reported by Envoy"""
         if self.endpoint_home_json_results is not None:
             home_json = self.endpoint_home_json_results.json()
-            if "enpower" in home_json.keys() and "grid_status" in home_json["enpower"].keys():
+            if (
+                "enpower" in home_json.keys()
+                and "grid_status" in home_json["enpower"].keys()
+            ):
                 return home_json["enpower"]["grid_status"]
 
         return self.message_grid_status_not_available
@@ -794,12 +806,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Retrieve energy information from the Enphase Envoy device."
     )
-    parser.add_argument(
-        "-u", "--user", dest="enlighten_user", help="Enlighten Username"
-    )
-    parser.add_argument(
-        "-p", "--pass", dest="enlighten_pass", help="Enlighten Password"
-    )
+    parser.add_argument("-u", "--user", dest="username", help="Enlighten Username")
+    parser.add_argument("-p", "--pass", dest="password", help="Enlighten Password")
     parser.add_argument(
         "-c",
         "--comissioned",
@@ -811,7 +819,7 @@ if __name__ == "__main__":
         "--ownertoken",
         dest="ownertoken",
         help="use the 6 month owner token  from enlighten instead of the 1hr entrez token",
-        action='store_true'
+        action="store_true",
     )
     parser.add_argument(
         "-i",
@@ -828,8 +836,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if (
-        args.enlighten_user is not None
-        and args.enlighten_pass is not None
+        args.username is not None
+        and args.password is not None
         and args.commissioned is not None
     ):
         SECURE = "s"
@@ -860,13 +868,11 @@ if __name__ == "__main__":
             HOST,
             USERNAME,
             inverters=True,
-            enlighten_user=args.enlighten_user,
-            enlighten_pass=args.enlighten_pass,
             commissioned=args.commissioned,
             enlighten_site_id=args.enlighten_site_id,
-            enlighten_serial_num=args.enlighten_serial_num,
+            serial_number=args.enlighten_serial_num,
             https_flag=SECURE,
-            use_enlighten_owner_token=args.ownertoken
+            use_enlighten=args.ownertoken,
         )
     else:
         TESTREADER = EnvoyReader(
@@ -874,13 +880,11 @@ if __name__ == "__main__":
             USERNAME,
             PASSWORD,
             inverters=True,
-            enlighten_user=args.enlighten_user,
-            enlighten_pass=args.enlighten_pass,
             commissioned=args.commissioned,
             enlighten_site_id=args.enlighten_site_id,
-            enlighten_serial_num=args.enlighten_serial_num,
+            serial_number=args.enlighten_serial_num,
             https_flag=SECURE,
-            use_enlighten_owner_token=args.ownertoken
+            use_enlighten=args.ownertoken,
         )
 
     TESTREADER.run_in_console()
